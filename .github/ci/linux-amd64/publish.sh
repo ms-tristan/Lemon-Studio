@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Copyright (C) 2026 ItsAlphaNeon
+# SPDX-License-Identifier: GPL-3.0-or-later
+# This file is part of Lemon Studio: https://github.com/ItsAlphaNeon/Lemon-Studio
+
 # Lemon Studio - publish a packaged Linux amd64 build to the nginx download endpoint.
 #
 # Run by .github/workflows/deploy-linux-amd64.yml on the self-hosted macOS
