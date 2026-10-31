@@ -707,6 +707,132 @@ pub fn select_range(s: &mut State, a: u32, b: u32) {
     s.piano.range = if b > a { Some((a, b)) } else { None };
 }
 
+/// Ctrl+Left / Ctrl+Right (§10): select the time block before / after the current time selection, of the same length
+/// as it, and the notes starting in it (FL's "Select time before/after selection equal to the selection length").
+/// Without a time selection (or before tick 0): nothing.
+pub fn select_time_step(s: &mut State, after: bool) -> bool {
+    let Some((a, b)) = s.piano.range.filter(|r| r.1 > r.0) else { return false };
+    let len = b - a;
+    let (from, to) = if after {
+        (b, b + len)
+    } else {
+        match a.checked_sub(len) {
+            Some(from) => (from, a),
+            None => return false,
+        }
+    };
+    select_range(s, from, to);
+    true
+}
+
+/// Ctrl+Delete (§10, as the arranger's Delete space): cut the time selection out of the pattern. The notes are split
+/// at both edges, what lies inside goes, and the notes and control points at or after its end move left by its span.
+/// A step (length 0) is a point: it is never split, and goes when it starts inside the span. Without a time selection:
+/// nothing.
+pub fn delete_space(s: &mut State) -> bool {
+    let Some((a, b)) = s.piano.range.filter(|r| r.1 > r.0) else { return false };
+    if notes(s).is_empty() && controls(s).is_empty() {
+        return false;
+    }
+    let len = b - a;
+    snapshot_as(s, "Piano roll delete space");
+    let taken = std::mem::take(&mut pattern_mut(s).notes);
+    let mut kept: Vec<Note> = Vec::with_capacity(taken.len());
+    for n in taken {
+        if n.length == 0 {
+            // A step is a point: no edge can split it; it goes when it starts inside the span, and moves with what
+            // follows the span.
+            if n.position >= b {
+                kept.push(Note { position: n.position - len, ..n });
+            } else if n.position < a {
+                kept.push(n);
+            }
+            continue;
+        }
+        let end = n.position + n.length;
+        if n.position >= b {
+            kept.push(Note { position: n.position - len, ..n });
+        } else if end <= a {
+            kept.push(n);
+        } else if n.position >= a {
+            // Starts in the span: only what runs past its end comes back, at the span's start.
+            if end > b {
+                kept.push(Note { position: a, length: end - b, ..n });
+            }
+        } else {
+            // Crosses its start: the part before it stays, the part past its end moves onto it.
+            kept.push(Note { length: a - n.position, ..n });
+            if end > b {
+                kept.push(Note { position: a, length: end - b, ..n });
+            }
+        }
+    }
+    let p = pattern_mut(s);
+    p.notes = kept;
+    p.controls.retain(|c| c.position < a || c.position >= b);
+    for c in &mut p.controls {
+        if c.position >= b {
+            c.position -= len;
+        }
+    }
+    close_space_edit(s);
+    true
+}
+
+/// Ctrl+Insert (§10, as the arranger's Insert space): open a gap the time selection's length at its start. The notes
+/// crossing its start are split, and the notes and control points at or after it move right by its span. A step
+/// (length 0) is a point: it only moves when it is at or after the gap. Without a time selection: nothing.
+pub fn insert_space(s: &mut State) -> bool {
+    let Some((a, b)) = s.piano.range.filter(|r| r.1 > r.0) else { return false };
+    if notes(s).is_empty() && controls(s).is_empty() {
+        return false;
+    }
+    let len = b - a;
+    snapshot_as(s, "Piano roll insert space");
+    let taken = std::mem::take(&mut pattern_mut(s).notes);
+    let mut kept: Vec<Note> = Vec::with_capacity(taken.len());
+    for n in taken {
+        if n.length == 0 {
+            // A step is a point: it only moves when it is at or after the gap.
+            if n.position >= a {
+                kept.push(Note { position: n.position + len, ..n });
+            } else {
+                kept.push(n);
+            }
+            continue;
+        }
+        let end = n.position + n.length;
+        if n.position >= a {
+            kept.push(Note { position: n.position + len, ..n });
+        } else if end > a {
+            // Across the gap's start: the part before it stays, the rest goes after the gap.
+            kept.push(Note { length: a - n.position, ..n });
+            kept.push(Note { position: a + len, length: end - a, ..n });
+        } else {
+            kept.push(n);
+        }
+    }
+    let p = pattern_mut(s);
+    p.notes = kept;
+    for c in &mut p.controls {
+        if c.position >= a {
+            c.position += len;
+        }
+    }
+    close_space_edit(s);
+    true
+}
+
+/// After a space edit: the selection indices are stale, the time selection stays where it was, the notes are stored in
+/// position order again (patterns.md).
+fn close_space_edit(s: &mut State) {
+    let range = s.piano.range;
+    s.piano.clear_selection();
+    s.piano.range = range;
+    s.piano.dirty = true;
+    finish_edit(s);
+}
+
 /// The selection, or every note of the channel when nothing is selected (§9 selection editing).
 pub fn targets(s: &State) -> Vec<usize> {
     let ch = channel(s);
@@ -1324,5 +1450,255 @@ mod tests {
             assert!((g.y_of(60) + g.row / 2.0 - grid.cy()).abs() <= g.row, "C5 centred");
         }
         set_check(&AUTO_ZOOM_PIANO, false);
+    }
+
+    /// A piano roll shown and painted, with three notes of channel 4 (C5, a beat apart and a beat long), and a
+    /// canvas for the frames that follow.
+    fn shown() -> Option<(App, os_ui::Canvas)> {
+        let mut c = os_ui::Canvas::new(1920, 1080, 1.0).ok()?;
+        let mut a = app();
+        a.state.z = vec![crate::app::Win::PianoRoll];
+        for i in 0..3 {
+            let at = add_note(&mut a.state, 4, 96 * i, 60);
+            pattern_mut(&mut a.state).notes[at].length = 96;
+        }
+        a.paint(&mut c, None);
+        Some((a, c))
+    }
+
+    /// The middle of note `i` and a point of empty grid above the notes: two key rows up, to their right.
+    fn spots(a: &App, i: usize) -> ((f32, f32), (f32, f32)) {
+        let g = a.piano_geom().expect("the piano roll is painted");
+        let r = g.note_rect(&notes(&a.state)[i]).expect("a visible note");
+        let empty = (r.right() + 40.0, g.y_of(62) + 2.0);
+        ((r.cx(), r.cy()), empty)
+    }
+
+    /// Ctrl is the Select tool in any piano-roll tool (spec: ui/piano-roll.md §9): Ctrl+click selects only the note
+    /// under the mouse, Ctrl+Shift+click adds it or takes it out, Ctrl+drag draws a box that replaces the selection
+    /// (Ctrl+Shift: adds to it), and Ctrl+click on empty grid space deselects every note.
+    #[test]
+    fn ctrl_is_the_select_tool_in_any_tool() {
+        use crate::app::Win;
+        use crate::piano::Tool;
+        let Some((mut a, mut c)) = shown() else { return };
+        let sel = |a: &App| a.state.piano.selection(a.state.pattern, Some(4));
+        let click = |a: &mut App, c: &mut os_ui::Canvas, p: (f32, f32), ctrl: bool, shift: bool| {
+            (a.ctrl, a.shift) = (ctrl, shift);
+            a.mouse_move(p.0, p.1);
+            a.mouse_down();
+            a.mouse_up();
+            (a.ctrl, a.shift) = (false, false);
+            a.paint(c, None);
+        };
+        let drag = |a: &mut App, c: &mut os_ui::Canvas, (x0, y0): (f32, f32), (x1, y1): (f32, f32), ctrl: bool, shift: bool| {
+            (a.ctrl, a.shift) = (ctrl, shift);
+            a.mouse_move(x0, y0);
+            a.mouse_down();
+            for i in 1..=10 {
+                let k = i as f32 / 10.0;
+                a.mouse_move(x0 + (x1 - x0) * k, y0 + (y1 - y0) * k);
+            }
+            a.mouse_up();
+            (a.ctrl, a.shift) = (false, false);
+            a.paint(c, None);
+        };
+        assert!(a.state.shown(Win::PianoRoll));
+        assert_eq!(a.state.piano.tool, Tool::Draw, "the Draw tool: Ctrl selects anyway");
+        let (n0, empty) = spots(&a, 0);
+        let (n1, _) = spots(&a, 1);
+        let (n2, _) = spots(&a, 2);
+
+        // Ctrl+click selects only the note; another replaces the selection.
+        click(&mut a, &mut c, n0, true, false);
+        assert_eq!(sel(&a), vec![0], "Ctrl+click selects only the note");
+        // A click that wiggles by a pixel still holds the note: its box is a pixel big, not nothing.
+        (a.ctrl, a.mouse) = (true, n0);
+        a.mouse_down();
+        a.mouse_move(n0.0 + 1.0, n0.1);
+        a.mouse_up();
+        a.ctrl = false;
+        a.paint(&mut c, None);
+        assert_eq!(sel(&a), vec![0], "a wiggling Ctrl+click keeps the note");
+        click(&mut a, &mut c, n1, true, false);
+        assert_eq!(sel(&a), vec![1], "Ctrl without Shift replaces");
+        // Ctrl+Shift+click adds, then takes it out again.
+        click(&mut a, &mut c, n2, true, true);
+        assert_eq!(sel(&a), vec![1, 2], "Ctrl+Shift adds");
+        click(&mut a, &mut c, n2, true, true);
+        assert_eq!(sel(&a), vec![1], "Ctrl+Shift removes a selected note");
+        // A click that wiggles by a pixel still counts as the Ctrl+Shift+click it started as: the note it took out
+        // stays out (the tiny box a wiggle draws would put it straight back).
+        (a.ctrl, a.shift, a.mouse) = (true, true, n1);
+        a.mouse_down();
+        a.mouse_move(n1.0 + 1.0, n1.1);
+        a.mouse_up();
+        (a.ctrl, a.shift) = (false, false);
+        a.paint(&mut c, None);
+        assert!(sel(&a).is_empty(), "a wiggling Ctrl+Shift+click keeps the note out");
+        // And one it adds stays in.
+        (a.ctrl, a.shift, a.mouse) = (true, true, n1);
+        a.mouse_down();
+        a.mouse_move(n1.0 + 1.0, n1.1);
+        a.mouse_up();
+        (a.ctrl, a.shift) = (false, false);
+        a.paint(&mut c, None);
+        assert_eq!(sel(&a), vec![1], "a wiggling Ctrl+Shift+click adds the note");
+        // Ctrl+click on empty grid space deselects every note.
+        click(&mut a, &mut c, empty, true, false);
+        assert!(sel(&a).is_empty(), "empty grid: nothing selected");
+        assert_eq!(notes(&a.state).len(), 3, "no note was added nor deleted");
+        // Ctrl+drag over the first two notes replaces the selection with them.
+        let g = a.piano_geom().unwrap();
+        let box0 = (g.x_of(0.0) + 2.0, g.y_of(62) + 2.0);
+        let box1 = (g.x_of(160.0), g.y_of(59) + g.row - 1.0);
+        drag(&mut a, &mut c, box0, box1, true, false);
+        assert_eq!(sel(&a), vec![0, 1], "the box's notes replace the selection");
+        // Ctrl+Shift+drag from empty grid adds the third note.
+        drag(&mut a, &mut c, (g.x_of(200.0), g.y_of(62) + 2.0), (g.x_of(300.0), g.y_of(59) + g.row - 1.0), true, true);
+        assert_eq!(sel(&a), vec![0, 1, 2], "the box adds to the selection");
+        // The Select tool keeps working: a plain click selects, Ctrl+Shift adds; a plain drag replaces.
+        a.state.piano.tool = Tool::Select;
+        a.state.piano.clear_selection();
+        click(&mut a, &mut c, n2, false, false);
+        assert_eq!(sel(&a), vec![2]);
+        click(&mut a, &mut c, n0, true, true);
+        assert_eq!(sel(&a), vec![2, 0], "Select tool: Ctrl+Shift adds");
+        drag(&mut a, &mut c, box0, box1, false, false);
+        assert_eq!(sel(&a), vec![0, 1], "Select tool: a plain box replaces");
+    }
+
+    /// Right-click on empty grid space deselects every note in every tool; right-click on a note keeps its tool's
+    /// behavior; and Ctrl+right-click zooms on the selection or, without notes, on the time selection, and does
+    /// nothing when there is neither (spec: ui/piano-roll.md §3a, §9).
+    #[test]
+    fn right_click_clears_and_zooms() {
+        use crate::piano::Tool;
+        let Some((mut a, mut c)) = shown() else { return };
+        let sel = |a: &App| a.state.piano.selection(a.state.pattern, Some(4));
+        let rclick = |a: &mut App, c: &mut os_ui::Canvas, p: (f32, f32), ctrl: bool| {
+            a.ctrl = ctrl;
+            a.mouse_move(p.0, p.1);
+            a.mouse_down_right();
+            a.mouse_up();
+            a.ctrl = false;
+            a.paint(c, None);
+        };
+        let (n0, empty) = spots(&a, 0);
+        for tool in [Tool::Draw, Tool::Select, Tool::Paint, Tool::Mute] {
+            a.state.piano.tool = tool;
+            a.state.piano.select(a.state.pattern, 4, vec![0, 1]);
+            rclick(&mut a, &mut c, empty, false);
+            assert!(sel(&a).is_empty(), "{tool:?}: right-click on empty grid deselects");
+            assert_eq!(notes(&a.state).len(), 3, "{tool:?}: and deletes nothing");
+        }
+        // Right-click on a note keeps its tool's behavior: the Select tool selects it.
+        a.state.piano.tool = Tool::Select;
+        rclick(&mut a, &mut c, n0, false);
+        assert_eq!(sel(&a), vec![0], "Select tool: right-click on a note selects it");
+        // Ctrl+right-click zooms on the selection, its span filling the grid; the view before it is remembered.
+        let z0 = a.state.piano.px_per_beat;
+        rclick(&mut a, &mut c, empty, true);
+        assert!(a.state.piano.px_per_beat > z0, "the selected note's span fills the grid: {}", a.state.piano.px_per_beat);
+        assert_eq!(a.state.piano.zoom_back.map(|(z, _, _)| z), Some(z0), "the view before it");
+        // No note selected: the time selection is zoomed on.
+        a.state.piano.clear_selection();
+        a.state.piano.range = Some((0, 192));
+        a.state.piano.px_per_beat = 50.0;
+        a.state.piano.zoom_back = None;
+        rclick(&mut a, &mut c, empty, true);
+        assert!(a.state.piano.px_per_beat > 50.0, "the time selection fills the grid: {}", a.state.piano.px_per_beat);
+        assert!(a.state.piano.zoom_back.is_some());
+        // Neither: nothing.
+        a.state.piano.clear_selection();
+        let (z, sx, sy) = (a.state.piano.px_per_beat, a.state.piano.scroll_x, a.state.piano.scroll_y);
+        rclick(&mut a, &mut c, empty, true);
+        assert_eq!((a.state.piano.px_per_beat, a.state.piano.scroll_x, a.state.piano.scroll_y), (z, sx, sy), "nothing selected: nothing");
+    }
+
+    /// Ctrl+Left / Ctrl+Right move the time selection to the block before / after it, the same length, and select the
+    /// notes starting there (spec §10; FL's "Select time before/after selection equal to the selection length");
+    /// Ctrl+Delete / Ctrl+Insert cut that span out of the pattern or open a gap its length at its start, each one
+    /// undo step (as the arranger's Delete space / Insert space).
+    #[test]
+    fn time_selection_steps_and_space_edits() {
+        use crate::app::Win;
+        use winit::keyboard::{Key, NamedKey};
+        let Some((mut a, mut c)) = shown() else { return };
+        assert!(a.state.shown(Win::PianoRoll));
+        let spans = |a: &App| -> Vec<(u32, u32)> { notes(&a.state).iter().map(|n| (n.position, n.length)).collect() };
+        // Ctrl+Right / Left step the time selection; there is none to begin with.
+        a.key(&Key::Named(NamedKey::ArrowRight), true, false);
+        assert_eq!(a.state.piano.range, None, "no time selection: no-op");
+        select_range(&mut a.state, 0, 96);
+        assert_eq!(a.state.piano.range, Some((0, 96)));
+        assert_eq!(a.state.piano.selection(a.state.pattern, Some(4)), vec![0]);
+        a.key(&Key::Named(NamedKey::ArrowRight), true, false);
+        assert_eq!(a.state.piano.range, Some((96, 192)), "the block after it, the same length");
+        assert_eq!(a.state.piano.selection(a.state.pattern, Some(4)), vec![1], "and its notes");
+        a.key(&Key::Named(NamedKey::ArrowRight), true, false);
+        assert_eq!(a.state.piano.range, Some((192, 288)));
+        a.key(&Key::Named(NamedKey::ArrowLeft), true, false);
+        assert_eq!(a.state.piano.range, Some((96, 192)));
+        // Ctrl+Delete: the span goes and later notes move left; one undo step.
+        a.paint(&mut c, None);
+        let before = spans(&a);
+        a.key(&Key::Named(NamedKey::Delete), true, false);
+        assert_eq!(spans(&a), vec![(0, 96), (96, 96)], "the second note went, the last moved left");
+        assert!(undo(&mut a.state), "one undo step");
+        assert_eq!(spans(&a), before);
+        // Ctrl+Insert: a gap the selection's length opens at its start and later notes move right.
+        a.state.piano.range = Some((96, 192));
+        a.key(&Key::Named(NamedKey::Insert), true, false);
+        assert_eq!(spans(&a), vec![(0, 96), (192, 96), (288, 96)], "the first note stays, the other two move right");
+        assert!(undo(&mut a.state), "one undo step");
+        assert_eq!(spans(&a), before);
+        // A note crossing both edges keeps only its two edges.
+        a.state.piano.range = Some((96, 192));
+        pattern_mut(&mut a.state).notes.push(Note { position: 48, length: 192, key: 72, ..Note::step(4, 48) });
+        finish_edit(&mut a.state);
+        a.paint(&mut c, None);
+        a.key(&Key::Named(NamedKey::Delete), true, false);
+        assert_eq!(spans(&a), vec![(0, 96), (48, 48), (96, 48), (96, 96)], "the crossing note keeps only its edges");
+        // Without a time selection the two keys do nothing.
+        a.state.piano.range = None;
+        let n = notes(&a.state).len();
+        a.key(&Key::Named(NamedKey::Delete), true, false);
+        a.key(&Key::Named(NamedKey::Insert), true, false);
+        assert_eq!(notes(&a.state).len(), n);
+    }
+
+    /// A step (length 0) is a point for the space edits: Ctrl+Insert moves it right when it is at or after the gap
+    /// without splitting it, and Ctrl+Delete drops it when it starts inside the span and moves the ones after the span
+    /// onto its start (spec §10, as the arranger's Delete space / Insert space).
+    #[test]
+    fn space_edits_keep_steps_as_points() {
+        use crate::app::Win;
+        use winit::keyboard::{Key, NamedKey};
+        let Some((mut a, _c)) = shown() else { return };
+        assert!(a.state.shown(Win::PianoRoll));
+        pattern_mut(&mut a.state).notes.clear();
+        for t in [48, 90, 96, 120, 192] {
+            add_note(&mut a.state, 4, t, 60);
+        }
+        for n in &mut pattern_mut(&mut a.state).notes {
+            n.length = 0;
+        }
+        let spans = |a: &App| -> Vec<(u32, u32)> { notes(&a.state).iter().map(|n| (n.position, n.length)).collect() };
+        let before = spans(&a);
+        assert_eq!(before, vec![(48, 0), (90, 0), (96, 0), (120, 0), (192, 0)]);
+        select_range(&mut a.state, 96, 192);
+        // Ctrl+Insert: the steps at or after 96 move right by the span, and the one at 90 a step-length display would
+        // have cut at 96 stays whole.
+        a.key(&Key::Named(NamedKey::Insert), true, false);
+        assert_eq!(spans(&a), vec![(48, 0), (90, 0), (192, 0), (216, 0), (288, 0)], "no step is split");
+        assert!(undo(&mut a.state));
+        assert_eq!(spans(&a), before);
+        // Ctrl+Delete: the steps at 96 and 120 go, and the one at 192 moves onto the span's start.
+        a.state.piano.range = Some((96, 192));
+        a.key(&Key::Named(NamedKey::Delete), true, false);
+        assert_eq!(spans(&a), vec![(48, 0), (90, 0), (96, 0)], "the one after the span moved onto its start");
+        assert!(undo(&mut a.state));
+        assert_eq!(spans(&a), before);
     }
 }

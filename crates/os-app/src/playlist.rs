@@ -80,7 +80,7 @@ impl PlTool {
             PlTool::Mute => "Mute (T) - click or drag mutes / unmutes clips",
             PlTool::Slip => "Slip (S) - drag moves a clip's content inside it",
             PlTool::Slice => "Slice (C) - drag a line to cut clips",
-            PlTool::Select => "Select (E) - drag a box to select (Ctrl adds)",
+            PlTool::Select => "Select (E) - drag a box to select (Shift adds); Ctrl selects in any tool",
             PlTool::Zoom => "Zoom (Z) - drag a box to zoom, right-click toggles",
             PlTool::Playback => "Playback (Y) - hold to play from the mouse",
         }
@@ -244,6 +244,9 @@ pub enum Cmd {
     SelectMuted,
     SelectSource,
     SelectTime,
+    /// Ctrl+Left / Ctrl+Right: select the time block before / after the current time selection, of the same length.
+    SelectTimeBefore,
+    SelectTimeAfter,
     ZoomIn,
     ZoomOut,
     ZoomAll,
@@ -367,6 +370,9 @@ pub enum Cmd {
     /// file... (spec: ui/midi-files.md §1).
     MidiImport(bool),
     MidiExport(bool),
+    /// The piano roll's File ▸ Paste from MIDI clipboard...: a Standard MIDI File from the system clipboard, imported
+    /// into the piano roll's channel without the form (spec: ui/midi-files.md §9).
+    PasteMidiClipboard,
     /// The Arpeggiate dialog's menus (spec: ui/piano-arpeggiate.md §1).
     Arp(crate::arpeggiate::ACmd),
     /// FILE ▸ Recent projects ▸ More: open recent project `n` (spec: ui/recent-projects.md §2).
@@ -1837,6 +1843,23 @@ pub fn delete_space(s: &mut State) -> bool {
     true
 }
 
+/// Ctrl+Left / Ctrl+Right (§5): select the time block before / after the current time selection, of the same length
+/// as it (FL's "Select time before/after selection equal to the selection length"). Without a time selection, or
+/// before tick 0: nothing.
+pub fn select_time_step(s: &mut State, after: bool) -> bool {
+    let Some((a, b)) = s.playlist.range.filter(|r| r.1 > r.0) else { return false };
+    let len = b - a;
+    s.playlist.range = Some(if after {
+        (b, b + len)
+    } else {
+        match a.checked_sub(len) {
+            Some(from) => (from, a),
+            None => return false,
+        }
+    });
+    true
+}
+
 /// Shift+Up / Down: move the selected clips' tracks (or the selected track) and their clips by `d`, swapping with
 /// the neighbours (track names, colours and states go along).
 pub fn shift_tracks(s: &mut State, d: i32) {
@@ -2826,6 +2849,9 @@ pub enum PlDrag {
     /// Right button held on empty grid: a horizontal drag turns into a slice (§3).
     RightPending { x0: f32, y0: f32 },
     ZoomBox { x0: f32, y0: f32 },
+    /// Ctrl+right-drag (§3): the box to zoom to; released without dragging (under [`ZOOM_CLICK_PX`]), it goes back
+    /// to the previous zoom instead.
+    ZoomBack { x0: f32, y0: f32 },
     Playback,
     SongPos,
     TimeSel { t0: u32 },
@@ -3011,8 +3037,8 @@ pub fn press_grid(app: &mut App, grid: Rect, right: bool) {
     let tool = s.playlist.tool;
     let alt = app.alt;
 
-    // Audio clip handles: fades, fade tensions, gain (§9a).
-    if let (Some(ci), false) = (hit, right) {
+    // Audio clip handles: fades, fade tensions, gain (§9a); Ctrl is the Select tool instead.
+    if let (Some(ci), false) = (hit, right) && !app.ctrl {
         if let Some(h) = handle_at(s, &g, ci, x, y) {
             snapshot(s);
             let c = clips(s)[ci];
@@ -3041,7 +3067,7 @@ pub fn press_grid(app: &mut App, grid: Rect, right: bool) {
         // opens what on an audio clip is General ▸ Input ▸ Manage shortcuts' (`crate::shortcuts::clip_double_click`):
         // Show clip properties does nothing yet (no clip properties window); with neither row's modifier (a row set to
         // "(disabled)"), the second click is a plain one.
-        if !right && matches!(tool, PlTool::Draw | PlTool::Paint | PlTool::Select) {
+        if !right && !app.ctrl && matches!(tool, PlTool::Draw | PlTool::Paint | PlTool::Select) {
             let audio = audio_clip_row(s, &c);
             if audio.is_some() || matches!(c.source, ClipSource::Pattern(_)) {
                 let now = std::time::Instant::now();
@@ -3100,29 +3126,44 @@ pub fn press_grid(app: &mut App, grid: Rect, right: bool) {
         }
         // The title strip's icon opens the clip menu (§10).
         let r = g.clip_rect(&c);
-        if !right && x < r.x + 14.0 && y < r.y + TITLE_H && r.w > 20.0 {
+        if !right && !app.ctrl && x < r.x + 14.0 && y < r.y + TITLE_H && r.w > 20.0 {
             s.playlist.popup = Some(clip_menu(s, ci, r.x, r.y + TITLE_H));
             return;
         }
     }
 
-    // Ctrl+drag selects in any tool; Ctrl+click toggles a clip (§3).
+    // Ctrl is the Select tool whatever the tool is (§3): Ctrl+click selects only the clip under the mouse (with its
+    // group), Ctrl+Shift+click adds or removes it, and a drag from empty grid or from a clip draws the marquee, whose
+    // contents replace the selection (Ctrl) or add to it (Ctrl+Shift).
     if app.ctrl && !right {
-        match hit {
-            Some(i) => {
+        let add = app.shift;
+        let base = match hit {
+            Some(i) if add => {
                 // A grouped clip toggles with its group.
                 let group = with_groups(s, vec![i]);
                 if s.playlist.sel.contains(&i) {
                     s.playlist.sel.retain(|j| !group.contains(j));
                 } else {
-                    s.playlist.sel.extend(group.into_iter().filter(|j| !s.playlist.sel.contains(j)).collect::<Vec<_>>());
+                    let mut add = group;
+                    add.retain(|j| !s.playlist.sel.contains(j));
+                    s.playlist.sel.extend(add);
                 }
+                s.playlist.sel.clone()
+            }
+            Some(i) => {
+                s.playlist.sel = with_groups(s, vec![i]);
+                Vec::new()
             }
             None => {
-                let base = s.playlist.sel.clone();
-                app.drag = Some(Drag::Pl(PlDrag::Marquee { x0: x, y0: y, base }));
+                if add {
+                    s.playlist.sel.clone()
+                } else {
+                    s.playlist.sel.clear();
+                    Vec::new()
+                }
             }
-        }
+        };
+        app.drag = Some(Drag::Pl(PlDrag::Marquee { x0: x, y0: y, base }));
         app.invalidate();
         return;
     }
@@ -3181,8 +3222,14 @@ pub fn press_grid(app: &mut App, grid: Rect, right: bool) {
             app.play_song_from(t);
         }
         PlTool::Select if hit.is_none() => {
-            s.playlist.sel.clear();
-            app.drag = Some(Drag::Pl(PlDrag::Marquee { x0: x, y0: y, base: Vec::new() }));
+            // Shift adds the box's clips to the selection (FL's Select tool); a plain drag replaces it.
+            let base = if app.shift {
+                s.playlist.sel.clone()
+            } else {
+                s.playlist.sel.clear();
+                Vec::new()
+            };
+            app.drag = Some(Drag::Pl(PlDrag::Marquee { x0: x, y0: y, base }));
         }
         PlTool::Draw | PlTool::Paint | PlTool::Select => match hit {
             // Right-Shift+drag on empty grid with Draw / Paint: a quick slice line, as the Slice tool (§3).
@@ -3205,6 +3252,17 @@ pub fn press_grid(app: &mut App, grid: Rect, right: bool) {
                 }
             }
             Some(i) => {
+                // The Select tool's Shift adds the clip (with its group) to the selection, and a drag goes on adding
+                // the clips it boxes in (FL's manual, §3).
+                if tool == PlTool::Select && app.shift {
+                    let mut group = with_groups(s, vec![i]);
+                    group.retain(|j| !s.playlist.sel.contains(j));
+                    s.playlist.sel.extend(group);
+                    let base = s.playlist.sel.clone();
+                    app.drag = Some(Drag::Pl(PlDrag::Marquee { x0: x, y0: y, base }));
+                    app.invalidate();
+                    return;
+                }
                 snapshot(s);
                 let c = clips(s)[i];
                 // Clicking a clip makes its source current (§3).
@@ -3317,6 +3375,7 @@ pub fn drag_move(app: &mut App, d: PlDrag, grid: Rect) {
             | PlDrag::Slip { .. }
             | PlDrag::Marquee { .. }
             | PlDrag::ZoomBox { .. }
+            | PlDrag::ZoomBack { .. }
             | PlDrag::TimeSel { .. }
             | PlDrag::Marker { .. }
             | PlDrag::Point { .. }
@@ -3411,15 +3470,20 @@ pub fn drag_move(app: &mut App, d: PlDrag, grid: Rect) {
             }
         }
         PlDrag::Marquee { x0, y0, base } => {
+            // A box 2 pixels wide and tall is a click that wiggled a pixel (a span counts both its edges): the press
+            // already chose what it holds, and boxing in from it would put a Ctrl+Shift toggle straight back. A real
+            // drag selects from there on.
             let r = Rect::span(x0.min(x), x0.max(x), y0.min(y), y0.max(y));
             s.playlist.overlay = Some(Overlay::Marquee(r));
-            let mut sel = base.clone();
-            for (i, c) in clips(s).iter().enumerate() {
-                if !sel.contains(&i) && g.clip_rect(c).intersect(&r).w > 0.0 && g.clip_rect(c).intersect(&r).h > 0.0 {
-                    sel.push(i);
+            if r.w > 2.0 || r.h > 2.0 {
+                let mut sel = base.clone();
+                for (i, c) in clips(s).iter().enumerate() {
+                    if !sel.contains(&i) && g.clip_rect(c).intersect(&r).w > 0.0 && g.clip_rect(c).intersect(&r).h > 0.0 {
+                        sel.push(i);
+                    }
                 }
+                s.playlist.sel = sel;
             }
-            s.playlist.sel = sel;
         }
         PlDrag::Slice { y0 } => {
             let t = snap_round(s, &g, g.tick_at(x), alt);
@@ -3435,7 +3499,7 @@ pub fn drag_move(app: &mut App, d: PlDrag, grid: Rect) {
                 app.drag = Some(Drag::Pl(PlDrag::Slice { y0 }));
             }
         }
-        PlDrag::ZoomBox { x0, y0 } => {
+        PlDrag::ZoomBox { x0, y0 } | PlDrag::ZoomBack { x0, y0 } => {
             s.playlist.overlay = Some(Overlay::ZoomBox(Rect::span(x0.min(x), x0.max(x), y0.min(y), y0.max(y))));
         }
         PlDrag::Playback => {}
@@ -3581,6 +3645,15 @@ pub fn drag_end(app: &mut App, d: PlDrag, grid: Rect) {
             }
         }
         PlDrag::ZoomBox { x0, y0 } => zoom_to(app, grid, x0, y0),
+        // Ctrl+right-click without dragging goes back to the previous zoom; Ctrl+right-drag zooms to its box (§3).
+        PlDrag::ZoomBack { x0, y0 } => {
+            let (x1, y1) = app.mouse;
+            if (x1 - x0).abs() < ZOOM_CLICK_PX && (y1 - y0).abs() < ZOOM_CLICK_PX {
+                zoom_back(app);
+            } else {
+                zoom_to(app, grid, x0, y0);
+            }
+        }
         PlDrag::Playback => app.transport.stop(),
         PlDrag::SongPos => {
             // The song jumps to the new position; a running pattern goes on as the song from there, a paused one
@@ -3678,6 +3751,34 @@ pub fn zoom_on(s: &mut State, grid: (f32, f32), idx: &[usize]) {
     s.playlist.row_h = fit.clamp(ROW_MIN, ROW_MAX);
     s.playlist_scroll.1 = Rows::new(s).top(top);
 }
+
+/// Ctrl+Shift+right-click (§3): zoom on the clip under the mouse, the view before it kept for Ctrl+right-click; no
+/// clip under the mouse = nothing.
+pub fn zoom_on_clip(app: &mut App, grid: Rect) {
+    let (x, y) = app.mouse;
+    let s = &mut app.state;
+    let g = PGeom::new(s, grid);
+    let Some(i) = clip_at(s, &g, x, y) else { return };
+    s.playlist.zoom_back = Some((s.playlist_bar_w, s.playlist_scroll.0, s.playlist_scroll.1));
+    zoom_on(s, (grid.w, grid.h), &[i]);
+    app.invalidate();
+}
+
+/// Ctrl+right-click (§3): back to the zoom before the last one, or the default view when there is none; this view is
+/// kept, so clicking again goes back to it (as the Zoom tool's right-click swaps the two).
+fn zoom_back(app: &mut App) {
+    let s = &mut app.state;
+    let here = (s.playlist_bar_w, s.playlist_scroll.0, s.playlist_scroll.1);
+    let (z, sx, sy) = s.playlist.zoom_back.unwrap_or((crate::views::playlist::BAR_W, 0.0, 0.0));
+    s.playlist.zoom_back = Some(here);
+    s.playlist_bar_w = z;
+    s.playlist_scroll = (sx, sy);
+    app.invalidate();
+}
+
+/// Pixels the mouse may move in a Ctrl+right-press and still count as a click (it goes back instead of zooming to a
+/// box, §3).
+pub const ZOOM_CLICK_PX: f32 = 4.0;
 
 /// The current arrangement's name.
 pub fn arrangement_name(s: &State) -> String {
@@ -4074,6 +4175,10 @@ pub fn run(app: &mut App, cmd: Cmd) -> Option<String> {
             app.import_midi_dialog(piano);
             return None;
         }
+        Cmd::PasteMidiClipboard => {
+            app.paste_midi_clipboard();
+            return None;
+        }
         Cmd::MidiExport(piano) => {
             app.export_midi_dialog(piano);
             return None;
@@ -4214,7 +4319,7 @@ pub fn run(app: &mut App, cmd: Cmd) -> Option<String> {
     let grid_w = grid.map_or(1400.0, |g| g.w);
     let grid_wh = grid.map_or((1400.0, 800.0), |g| (g.w, g.h));
     let msg = match cmd {
-        Cmd::Nothing | Cmd::Pick(..) | Cmd::Browser(_) | Cmd::Plugin(_) | Cmd::Project(_) | Cmd::Rack(_) | Cmd::Mixer(_) | Cmd::SlotWin(..) | Cmd::Param(_) | Cmd::EditEvents(..) | Cmd::Events(_) | Cmd::Preset(_) | Cmd::Misc(..) | Cmd::PluginMenu(..) | Cmd::PluginDetach(..) | Cmd::Piano(_) | Cmd::Audio(_) | Cmd::Cpu(_) | Cmd::MetronomeSound(_) | Cmd::MetronomeVolume(_) | Cmd::Record(_) | Cmd::RecPrecountBars(_) | Cmd::OneClick(..) | Cmd::OneClickEditor | Cmd::Rec(_) | Cmd::ContinuousScrolling | Cmd::Pattern(_) | Cmd::ClockMode(_) | Cmd::ClockBeat(_) | Cmd::Toolbar(_) | Cmd::ToolbarPreset(_) | Cmd::ToolbarSave | Cmd::ToolbarDelete | Cmd::Arrange(_) | Cmd::Wallpaper | Cmd::TimeSig(..) | Cmd::AddSignature | Cmd::MarkerSigAt(_) | Cmd::MarkerEveryMenu | Cmd::Bar(..) | Cmd::PanningLaw(_) | Cmd::TimeMode(_) | Cmd::Timebase(_) | Cmd::KeyMarkerMenu | Cmd::KeyRoot(_) => None,
+        Cmd::Nothing | Cmd::Pick(..) | Cmd::Browser(_) | Cmd::Plugin(_) | Cmd::Project(_) | Cmd::Rack(_) | Cmd::Mixer(_) | Cmd::SlotWin(..) | Cmd::Param(_) | Cmd::EditEvents(..) | Cmd::Events(_) | Cmd::Preset(_) | Cmd::Misc(..) | Cmd::PluginMenu(..) | Cmd::PluginDetach(..) | Cmd::Piano(_) | Cmd::PasteMidiClipboard | Cmd::Audio(_) | Cmd::Cpu(_) | Cmd::MetronomeSound(_) | Cmd::MetronomeVolume(_) | Cmd::Record(_) | Cmd::RecPrecountBars(_) | Cmd::OneClick(..) | Cmd::OneClickEditor | Cmd::Rec(_) | Cmd::ContinuousScrolling | Cmd::Pattern(_) | Cmd::ClockMode(_) | Cmd::ClockBeat(_) | Cmd::Toolbar(_) | Cmd::ToolbarPreset(_) | Cmd::ToolbarSave | Cmd::ToolbarDelete | Cmd::Arrange(_) | Cmd::Wallpaper | Cmd::TimeSig(..) | Cmd::AddSignature | Cmd::MarkerSigAt(_) | Cmd::MarkerEveryMenu | Cmd::Bar(..) | Cmd::PanningLaw(_) | Cmd::TimeMode(_) | Cmd::Timebase(_) | Cmd::KeyMarkerMenu | Cmd::KeyRoot(_) => None,
         Cmd::NotYet(name) => Some(format!("{name}: not available yet")),
         Cmd::Tool(t) => {
             s.playlist.tool = t;
@@ -4359,6 +4464,10 @@ pub fn run(app: &mut App, cmd: Cmd) -> Option<String> {
             let a = idx.iter().filter_map(|&i| clips(s).get(i)).map(|c| c.position).min();
             let b = idx.iter().filter_map(|&i| clips(s).get(i)).map(Clip::end).max();
             s.playlist.range = a.zip(b);
+            None
+        }
+        Cmd::SelectTimeBefore | Cmd::SelectTimeAfter => {
+            select_time_step(s, cmd == Cmd::SelectTimeAfter);
             None
         }
         Cmd::ZoomIn | Cmd::ZoomOut => {
@@ -4943,8 +5052,20 @@ pub fn key(app: &mut App, key: &winit::keyboard::Key, ctrl: bool, alt: bool) -> 
         Key::Character(c) if shift && !ctrl && !alt && c.eq_ignore_ascii_case("z") => Cmd::ZoomSelection,
         Key::Character(c) if shift && !ctrl && !alt && c.eq_ignore_ascii_case("m") => Cmd::StretchMode,
         Key::Character(c) if shift && !ctrl && !alt && c.eq_ignore_ascii_case("i") => Cmd::InvertSelection,
+        // Shift+C is bound before the tool letters, which would switch to the Slice tool (§3).
+        Key::Character(c) if shift && !ctrl && !alt && c.eq_ignore_ascii_case("c") => Cmd::SelectSource,
         Key::Character(c) if shift && !ctrl && !alt && (c == "4" || c == "$") => Cmd::ZoomAll,
         Key::Character(c) if shift && !ctrl && !alt && (c == "5" || c == "%") => Cmd::ZoomSelection,
+        Key::Character(c) if shift && !ctrl && !alt && (c == "0" || c == ")") => {
+            // Shift+0: centre the view on the playhead (§5).
+            let s = &mut app.state;
+            if let Some(grid) = crate::views::playlist::grid_of(s) {
+                let x = s.playlist.pos as f32 / bar(s) as f32 * s.playlist_bar_w;
+                s.playlist_scroll.0 = (x - grid.w / 2.0).max(0.0);
+            }
+            app.invalidate();
+            return true;
+        }
         Key::Character(c) if shift && !ctrl && !alt && c.eq_ignore_ascii_case("g") => Cmd::GroupClips,
         Key::Character(c) if alt && !ctrl && (c.eq_ignore_ascii_case("g") || c.eq_ignore_ascii_case("u")) => Cmd::UngroupClips,
         Key::Named(NamedKey::End) if !ctrl && !alt => Cmd::ZoomSelection,
@@ -4969,6 +5090,9 @@ pub fn key(app: &mut App, key: &winit::keyboard::Key, ctrl: bool, alt: bool) -> 
         Key::Named(NamedKey::ArrowRight) if shift => Cmd::ShiftTime(1),
         Key::Named(NamedKey::ArrowUp) if shift => Cmd::ShiftTracks(-1),
         Key::Named(NamedKey::ArrowDown) if shift => Cmd::ShiftTracks(1),
+        // Ctrl+Left / Right: the time selection moves to the block before / after it, the same length (§5).
+        Key::Named(NamedKey::ArrowLeft) if ctrl && !alt => Cmd::SelectTimeBefore,
+        Key::Named(NamedKey::ArrowRight) if ctrl && !alt => Cmd::SelectTimeAfter,
         Key::Named(NamedKey::ArrowUp) if ctrl => {
             let s = &mut app.state;
             s.playlist.track = s.playlist.track.saturating_sub(1);
@@ -4981,11 +5105,12 @@ pub fn key(app: &mut App, key: &winit::keyboard::Key, ctrl: bool, alt: bool) -> 
             app.invalidate();
             return true;
         }
-        Key::Named(NamedKey::Enter) if ctrl => {
-            // Play from the song start.
-            app.state.song_mode = true;
+        // Ctrl+Enter: the time selection around the selected clips (§5, as the Clip menu's entry says).
+        Key::Named(NamedKey::Enter) if ctrl => Cmd::SelectTime,
+        // Home: the playhead goes to the start of the playlist (§5).
+        Key::Named(NamedKey::Home) if !ctrl && !alt => {
             app.state.playlist.pos = 0;
-            app.play_song_from(0);
+            app.invalidate();
             return true;
         }
         Key::Named(NamedKey::Escape) => {
@@ -5233,5 +5358,242 @@ mod tests {
         assert_eq!(app.state.selected_mixer, 5, "the selection stays");
         crate::history::undo(&mut app.state);
         assert!(crate::mixer::track(&app.state, t).unwrap().slots[usize::from(k)].is_some(), "one undo step");
+    }
+
+    /// A playlist holding three clips of the current source, two bars apart (tracks 0, 1 and 2), its view painted:
+    /// the app, the canvas it paints into and the grid's geometry.
+    fn arrangement() -> Option<(App, os_ui::Canvas, PGeom)> {
+        let mut c = os_ui::Canvas::new(1920, 1080, 1.0).ok()?;
+        let mut app = app();
+        app.state.playlist.reset();
+        app.state.playlist.row_h = ROW_H;
+        app.state.z = vec![crate::app::Win::Playlist];
+        let bar = 4 * u32::from(app.state.project.ppq.max(4));
+        for t in 0..3u16 {
+            place(&mut app.state, t, u32::from(t) * 2 * bar);
+        }
+        app.paint(&mut c, None);
+        let grid = app.pl_grid().expect("the playlist is painted");
+        let g = PGeom::new(&app.state, grid);
+        Some((app, c, g))
+    }
+
+    /// Ctrl is the Select tool in any tool (spec: ui/playlist.md §3): Ctrl+click selects only the clip under the
+    /// mouse, Ctrl+Shift+click adds it or takes it out, Ctrl+drag draws a marquee that replaces the selection
+    /// (Ctrl+Shift: adds to it), Ctrl+click on empty grid space deselects, and the Select tool's Shift adds.
+    #[test]
+    fn ctrl_is_the_select_tool_in_any_tool() {
+        let Some((mut app, mut c, g)) = arrangement() else { return };
+        let all = clips(&app.state).to_vec();
+        assert_eq!(all.len(), 3);
+        let bar = 4 * u32::from(app.state.project.ppq.max(4));
+        let at = |i: usize| {
+            let r = g.clip_rect(&all[i]);
+            (r.cx(), r.cy())
+        };
+        // Empty grid: below the clips, in a track none of them uses.
+        let empty = (g.x_of((7 * bar) as f32) + 4.0, g.y_of(5) + 10.0);
+        let click = |app: &mut App, c: &mut os_ui::Canvas, p: (f32, f32), ctrl: bool, shift: bool| {
+            (app.ctrl, app.shift) = (ctrl, shift);
+            app.state.playlist.last_clip = None;
+            app.mouse_move(p.0, p.1);
+            app.mouse_down();
+            app.mouse_up();
+            (app.ctrl, app.shift) = (false, false);
+            app.paint(c, None);
+        };
+        let drag = |app: &mut App, c: &mut os_ui::Canvas, (x0, y0): (f32, f32), (x1, y1): (f32, f32), ctrl: bool, shift: bool| {
+            (app.ctrl, app.shift) = (ctrl, shift);
+            app.state.playlist.last_clip = None;
+            app.mouse_move(x0, y0);
+            app.mouse_down();
+            for i in 1..=10 {
+                let k = i as f32 / 10.0;
+                app.mouse_move(x0 + (x1 - x0) * k, y0 + (y1 - y0) * k);
+            }
+            app.mouse_up();
+            (app.ctrl, app.shift) = (false, false);
+            app.paint(c, None);
+        };
+
+        // With the Delete tool a plain click deletes; Ctrl+click selects instead.
+        app.state.playlist.tool = PlTool::Delete;
+        click(&mut app, &mut c, at(1), true, false);
+        assert_eq!(app.state.playlist.sel, vec![1], "Ctrl selects with any tool");
+        assert_eq!(clips(&app.state).len(), 3, "and deletes nothing");
+        // Ctrl+click on another clip replaces the selection.
+        click(&mut app, &mut c, at(2), true, false);
+        assert_eq!(app.state.playlist.sel, vec![2], "Ctrl without Shift replaces");
+        // Ctrl+Shift+click adds it back, then takes it out again.
+        click(&mut app, &mut c, at(1), true, true);
+        assert_eq!(app.state.playlist.sel, vec![2, 1], "Ctrl+Shift adds");
+        click(&mut app, &mut c, at(1), true, true);
+        assert_eq!(app.state.playlist.sel, vec![2], "Ctrl+Shift removes a selected clip");
+        // A click that wiggles by a pixel still counts as the Ctrl+Shift+click it started as: the clip it took out
+        // stays out (the tiny box a wiggle draws would put it straight back).
+        (app.ctrl, app.shift) = (true, true);
+        app.mouse_move(at(2).0, at(2).1);
+        app.mouse_down();
+        app.mouse_move(at(2).0 + 1.0, at(2).1);
+        app.mouse_up();
+        (app.ctrl, app.shift) = (false, false);
+        app.paint(&mut c, None);
+        assert!(app.state.playlist.sel.is_empty(), "a wiggling Ctrl+Shift+click keeps the clip out");
+        // And one it adds stays in.
+        (app.ctrl, app.shift) = (true, true);
+        app.mouse_move(at(2).0, at(2).1);
+        app.mouse_down();
+        app.mouse_move(at(2).0 + 1.0, at(2).1);
+        app.mouse_up();
+        (app.ctrl, app.shift) = (false, false);
+        app.paint(&mut c, None);
+        assert_eq!(app.state.playlist.sel, vec![2], "a wiggling Ctrl+Shift+click adds the clip");
+        // Ctrl+click on empty grid space deselects.
+        click(&mut app, &mut c, empty, true, false);
+        assert!(app.state.playlist.sel.is_empty(), "empty grid: nothing selected");
+        assert_eq!(clips(&app.state).len(), 3, "no clip was placed nor deleted");
+        // Ctrl+drag a box over the first two clips: it replaces the selection.
+        let (r0, r1) = (g.clip_rect(&all[0]), g.clip_rect(&all[1]));
+        drag(&mut app, &mut c, (r0.x + 1.0, r0.y + 2.0), (r1.right() - 1.0, r1.bottom() - 1.0), true, false);
+        assert_eq!(app.state.playlist.sel, vec![0, 1], "the box's clips replace the selection");
+        // Ctrl+Shift+drag from a clip adds: the third one joins the selection.
+        let r2 = g.clip_rect(&all[2]);
+        drag(&mut app, &mut c, (r2.x + 1.0, r2.y + 2.0), (r2.right() - 1.0, r2.bottom() - 1.0), true, true);
+        assert_eq!(app.state.playlist.sel, vec![0, 1, 2], "the box adds to the selection");
+        // And from empty grid space, the box starting anywhere adds what it boxes in too.
+        app.state.playlist.sel = vec![2];
+        drag(&mut app, &mut c, empty, (r0.x + 2.0, r0.y + 2.0), true, true);
+        assert_eq!(app.state.playlist.sel, vec![2, 0, 1], "a box from empty grid space adds");
+        // The Select tool's Shift adds a clicked clip (FL's manual), and a plain drag from empty replaces.
+        app.state.playlist.tool = PlTool::Select;
+        app.state.playlist.sel.clear();
+        click(&mut app, &mut c, at(2), false, false);
+        assert_eq!(app.state.playlist.sel, vec![2]);
+        click(&mut app, &mut c, at(0), false, true);
+        assert_eq!(app.state.playlist.sel, vec![2, 0], "Select tool: Shift adds");
+        // Shift+dragging from a clip keeps the selection and boxes in the clips the box covers (FL's manual).
+        drag(&mut app, &mut c, (r0.cx(), r0.cy()), (r1.right() - 1.0, r1.bottom() - 1.0), false, true);
+        assert_eq!(app.state.playlist.sel, vec![2, 0, 1], "Select tool: Shift+drag adds");
+        // A plain Select-tool box from empty grid (below the clip, track 5) up to the second clip's end: the clips
+        // it covers replace the selection.
+        let below = (r0.x + 1.0, g.y_of(5) + 10.0);
+        drag(&mut app, &mut c, below, (r1.right() - 1.0, r1.bottom() - 1.0), false, false);
+        assert_eq!(app.state.playlist.sel, vec![1], "Select tool: a plain box replaces the selection");
+    }
+
+    /// Ctrl+Enter selects the time around the selected clips, and Ctrl+Left / Ctrl+Right move the time selection to
+    /// the block before / after it, the same length as it (spec §5, FL's "Select time before/after selection equal to
+    /// the selection length"); without one they do nothing.
+    #[test]
+    fn ctrl_time_selection() {
+        let Some((mut app, mut c, _g)) = arrangement() else { return };
+        let bar = 4 * u32::from(app.state.project.ppq.max(4));
+        let step = |app: &mut App, c: &mut os_ui::Canvas, k: winit::keyboard::NamedKey| {
+            app.key(&winit::keyboard::Key::Named(k), true, false);
+            app.paint(c, None);
+        };
+        // No time selection: nothing to step from.
+        app.state.playlist.range = None;
+        step(&mut app, &mut c, winit::keyboard::NamedKey::ArrowRight);
+        assert_eq!(app.state.playlist.range, None);
+        // Ctrl+Enter: the selected clip's span.
+        app.state.playlist.sel = vec![1];
+        step(&mut app, &mut c, winit::keyboard::NamedKey::Enter);
+        assert_eq!(app.state.playlist.range, Some((2 * bar, 3 * bar)), "the time around the selection");
+        // Ctrl+Right: the block after it, the same length; again.
+        step(&mut app, &mut c, winit::keyboard::NamedKey::ArrowRight);
+        assert_eq!(app.state.playlist.range, Some((3 * bar, 4 * bar)));
+        step(&mut app, &mut c, winit::keyboard::NamedKey::ArrowRight);
+        assert_eq!(app.state.playlist.range, Some((4 * bar, 5 * bar)));
+        // Ctrl+Left: back, block by block; nothing before the start of the song.
+        step(&mut app, &mut c, winit::keyboard::NamedKey::ArrowLeft);
+        assert_eq!(app.state.playlist.range, Some((3 * bar, 4 * bar)));
+        app.state.playlist.range = Some((0, bar));
+        step(&mut app, &mut c, winit::keyboard::NamedKey::ArrowLeft);
+        assert_eq!(app.state.playlist.range, Some((0, bar)), "nothing before tick 0");
+    }
+
+    /// Home, Shift+0, Shift+C and Ctrl+Enter (spec §3, §5): the playhead goes to the start, the view centres on it,
+    /// every clip of the current source is selected instead of the Slice tool being picked, and Ctrl+Enter selects
+    /// time instead of starting the song from its start.
+    #[test]
+    fn arranger_keys() {
+        let Some((mut app, mut c, g)) = arrangement() else { return };
+        let bar = 4 * u32::from(app.state.project.ppq.max(4));
+        app.state.playlist.pos = 9 * bar;
+        app.key(&winit::keyboard::Key::Named(winit::keyboard::NamedKey::Home), false, false);
+        assert_eq!(app.state.playlist.pos, 0, "Home: the start of the playlist");
+        // Shift+0 centres the view on the playhead.
+        app.state.playlist_bar_w = crate::views::playlist::BAR_W;
+        app.state.playlist.pos = 40 * bar;
+        app.shift = true;
+        app.key(&winit::keyboard::Key::Character("0".into()), false, false);
+        app.shift = false;
+        let x = 40.0 * app.state.playlist_bar_w - g.grid.w / 2.0;
+        assert!((app.state.playlist_scroll.0 - x).abs() < 0.01, "{} vs {x}", app.state.playlist_scroll.0);
+        app.state.playlist_scroll.0 = 0.0;
+        // Shift+C selects every clip of the current source, and is no tool letter.
+        app.state.playlist.tool = PlTool::Draw;
+        app.state.playlist.source = Some(os_model::ClipSource::Pattern(1));
+        app.shift = true;
+        app.key(&winit::keyboard::Key::Character("C".into()), false, false);
+        app.shift = false;
+        assert_eq!(app.state.playlist.tool, PlTool::Draw, "Shift+C is not the Slice tool");
+        assert_eq!(app.state.playlist.sel, vec![0, 1, 2], "every clip of the source");
+        // Ctrl+Enter selects time, and does not start the song.
+        app.state.playlist.sel = vec![0];
+        app.key(&winit::keyboard::Key::Named(winit::keyboard::NamedKey::Enter), true, false);
+        app.paint(&mut c, None);
+        assert_eq!(app.state.playlist.range, Some((0, bar)));
+        assert!(!app.transport.playing(), "Ctrl+Enter does not play");
+    }
+
+    /// Ctrl+right-click goes back to the previous zoom (the default view when there is none) instead of zooming in
+    /// 2x; Ctrl+right-drag still zooms to the dragged box; Ctrl+Shift+right-click zooms on the clip under the mouse
+    /// (spec §3).
+    #[test]
+    fn ctrl_right_click_zoom() {
+        let Some((mut app, mut c, g)) = arrangement() else { return };
+        let all = clips(&app.state).to_vec();
+        let bar = 4 * u32::from(app.state.project.ppq.max(4));
+        let rclick = |app: &mut App, c: &mut os_ui::Canvas, (x0, y0): (f32, f32), (x1, y1): (f32, f32), ctrl: bool, shift: bool| {
+            (app.ctrl, app.shift) = (ctrl, shift);
+            app.mouse_move(x0, y0);
+            app.mouse_down_right();
+            for i in 1..=10 {
+                let k = i as f32 / 10.0;
+                app.mouse_move(x0 + (x1 - x0) * k, y0 + (y1 - y0) * k);
+            }
+            app.mouse_up();
+            (app.ctrl, app.shift) = (false, false);
+            app.paint(c, None);
+        };
+        let start = (app.state.playlist_bar_w, app.state.playlist_scroll.0);
+        // Ctrl+right-drag: zoom to a box of two bars, the view before it remembered.
+        rclick(&mut app, &mut c, (g.x_of(0.0), g.y_of(0) + 10.0), (g.x_of((2 * bar) as f32), g.y_of(1) + 10.0), true, false);
+        assert!(app.state.playlist_bar_w > start.0, "the box zoomed in: {}", app.state.playlist_bar_w);
+        assert_eq!(app.state.playlist.zoom_back, Some((start.0, start.1, 0.0)), "the view before it");
+        // Ctrl+right-click without a drag: back to the view before the box.
+        let p = (g.grid.cx(), g.grid.cy());
+        rclick(&mut app, &mut c, p, p, true, false);
+        assert_eq!((app.state.playlist_bar_w, app.state.playlist_scroll.0), start, "back to the last zoom");
+        // With no zoom remembered: the default view.
+        app.state.playlist.zoom_back = None;
+        app.state.playlist_bar_w = 300.0;
+        app.state.playlist_scroll.0 = 700.0;
+        rclick(&mut app, &mut c, p, p, true, false);
+        assert_eq!(app.state.playlist_bar_w, crate::views::playlist::BAR_W);
+        assert_eq!(app.state.playlist_scroll.0, 0.0);
+        // Ctrl+Shift+right-click on a clip zooms on it: a whole clip fills the view, up to the largest zoom.
+        let r = g.clip_rect(&all[1]);
+        rclick(&mut app, &mut c, (r.cx(), r.cy()), (r.cx(), r.cy()), true, true);
+        assert_eq!(app.state.playlist_bar_w, 600.0, "one clip fills the view");
+        assert!((app.state.playlist_scroll.0 - all[1].position as f32 / bar as f32 * 600.0).abs() < 0.01);
+        assert!(app.state.playlist.zoom_back.is_some(), "the view before it");
+        // On empty grid there is no clip to zoom on: nothing moves.
+        let empty = (g.x_of((40 * bar) as f32) + 4.0, g.y_of(5) + 10.0);
+        let (bw, sx) = (app.state.playlist_bar_w, app.state.playlist_scroll.0);
+        rclick(&mut app, &mut c, empty, empty, true, true);
+        assert_eq!((app.state.playlist_bar_w, app.state.playlist_scroll.0), (bw, sx), "no clip: nothing");
     }
 }

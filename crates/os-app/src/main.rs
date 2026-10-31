@@ -64,6 +64,7 @@ mod messages;
 mod meters;
 mod metronome;
 mod midi_cfg;
+mod midi_clipboard;
 mod midi_file;
 mod midi_in;
 mod midi_out;

@@ -147,7 +147,7 @@ thread_local! {
 }
 
 /// The settings a form for file `f` opens with: Realign events on for a file with a leading silence (spec §10.5).
-fn options_for(f: &Smf) -> Options {
+pub(crate) fn options_for(f: &Smf) -> Options {
     let last = LAST.with_borrow(Clone::clone).unwrap_or_default();
     let realign = last.realign || leading_silence(f);
     Options { track: None, channels: [true; 16], per_track: f.format == 1, realign, ..last }
@@ -704,7 +704,7 @@ impl App {
 
     /// The piano roll's import (spec §9): every chosen track's notes into its channel in the current pattern, replacing
     /// the channel's notes there unless Blend is on; the imported notes selected. One undo step.
-    fn import_into_piano(&mut self, path: &Path, f: &Smf, o: &Options) {
+    pub(crate) fn import_into_piano(&mut self, path: &Path, f: &Smf, o: &Options) {
         let s = &mut self.state;
         let Some(ch) = crate::piano::channel(s) else { return };
         let imp = convert(f, &Options { per_track: true, ..o.clone() }, s.project.ppq.max(1));

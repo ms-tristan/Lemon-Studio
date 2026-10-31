@@ -360,7 +360,7 @@ fn toolbar(ui: &mut Ui, s: &State, r: Rect, shift: f32) {
         (422.0, Icon::Delete, "Delete (D): click or swipe to delete notes", Some(Action::PianoTool(Tool::Delete))),
         (442.0, Icon::Mute, "Mute (T): click or swipe to mute / unmute notes", Some(Action::PianoTool(Tool::Mute))),
         (463.0, Icon::Slice, "Slice (C): drag a line to cut notes", Some(Action::PianoTool(Tool::Slice))),
-        (485.0, Icon::Select, "Select (E): drag a box to select notes, Ctrl adds", Some(Action::PianoTool(Tool::Select))),
+        (485.0, Icon::Select, "Select (E): drag a box to select notes, Ctrl+Shift adds; Ctrl selects in any tool", Some(Action::PianoTool(Tool::Select))),
         (507.0, Icon::Zoom, "Zoom (Z): drag a box to zoom, right-click zooms out / back", Some(Action::PianoTool(Tool::Zoom))),
         (527.0, Icon::Speaker, "Playback (Y): drag to hear the notes under the line", Some(Action::PianoTool(Tool::Playback))),
     ];
