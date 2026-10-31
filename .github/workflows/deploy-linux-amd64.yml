@@ -1,0 +1,196 @@
+# Builds the Linux x86_64 release on native Ubuntu and publishes it from the
+# self-hosted macOS runner to the nginx download endpoint
+# https://lemon.tristanmasse.space/download/linux/amd64/ (HTTP Basic auth).
+#
+# The two halves are split for a reason: this Mac is an ARM64 macOS machine, and
+# its only Linux container runtime is a QEMU-backed Lima VM without Rosetta, so
+# compiling x86_64 there would mean emulating every rustc invocation. The build
+# therefore runs on GitHub's ubuntu-24.04 image, which is the same native x86_64
+# platform the endpoint documents (glibc 2.39); the self-hosted runner does the
+# part that needs this machine: publishing the tarball behind nginx and checking
+# the public download end to end. The workflow still runs on every push to main;
+# a merge or a direct commit is all it takes to refresh the download.
+name: Build and publish Linux amd64
+
+"on":
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: deploy-linux-amd64-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Linux x86_64 release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # Same packages as the upstream CI: ALSA, Wayland (Lemon Sampler's file
+      # dialogs link wayland-client) and libclang (the time stretcher's
+      # bindings are generated at build time).
+      - name: Install Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libwayland-dev libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: |
+          cargo --version
+          rustc --version
+          cargo build --release -p os-app --locked
+
+      # Native x86_64 runtime check: `--render` without arguments is handled
+      # before any window or audio device is opened, so this proves the binary
+      # actually starts and links against the runner's glibc/ALSA.
+      - name: Smoke test the binary
+        run: |
+          set +e
+          OUT="$(timeout 30 ./target/release/lemonstudio --render 2>&1)"
+          CODE=$?
+          set -e
+          printf '%s\n' "$OUT"
+          echo "exit code: $CODE"
+          ldd ./target/release/lemonstudio
+          [ "$CODE" -eq 2 ]
+          printf '%s' "$OUT" | grep -q "usage: lemonstudio --render"
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -A3 '^\[workspace.package\]' Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          NAME="lemonstudio-${VERSION}-linux-amd64"
+          DIST="dist"
+          PKG="$DIST/lemonstudio"
+
+          test -x target/release/lemonstudio
+          rm -rf "$PKG"
+          mkdir -p "$PKG"
+          cp target/release/lemonstudio "$PKG/lemonstudio"
+          strip --strip-unneeded "$PKG/lemonstudio"
+          install -m 644 crates/os-app/assets/lemonstudio.png "$PKG/lemonstudio.png"
+          install -m 644 crates/os-app/assets/lemonstudio.desktop "$PKG/lemonstudio.desktop"
+          install -m 644 LICENSE "$PKG/LICENSE"
+          install -m 644 THIRD-PARTY-NOTICES.txt "$PKG/THIRD-PARTY-NOTICES.txt"
+
+          cat > "$PKG/INSTALL.md" <<EOF
+          # Lemon Studio ${VERSION} — Linux x86_64
+
+          Private build of Lemon Studio (commit \`${COMMIT}\`, built ${BUILT_AT}
+          on Ubuntu 24.04 x86_64).
+
+          Lemon Studio is pre-alpha software: keep backups of your \`.flp\` projects
+          and do not overwrite originals with files it saves.
+
+          ## Contents
+
+          - \`lemonstudio\` — the application (stripped release binary)
+          - \`lemonstudio.png\` — 256x256 icon
+          - \`lemonstudio.desktop\` — application-menu entry
+          - \`LICENSE\`, \`THIRD-PARTY-NOTICES.txt\`
+
+          ## Requirements
+
+          - Linux x86_64 (X11, or Wayland through XWayland)
+          - glibc 2.39 or newer: Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch current
+          - ALSA runtime (\`libasound.so.2\`, normally installed)
+          - \`zenity\` or KDE's \`kdialog\` for the "save changes?" prompt (optional)
+
+          Lemon Studio's own instruments and effects are compiled into the binary;
+          no plugin bundle is needed to use them.
+
+          ## Install (no root)
+
+          \`\`\`bash
+          install -Dm755 lemonstudio ~/.local/bin/lemonstudio
+          install -Dm644 lemonstudio.png ~/.local/share/icons/hicolor/256x256/apps/lemonstudio.png
+          install -Dm644 lemonstudio.desktop ~/.local/share/applications/lemonstudio.desktop
+          \`\`\`
+
+          Make sure \`~/.local/bin\` is on your \`PATH\`, then start Lemon Studio from
+          the application menu or with \`lemonstudio\`. Open a project with
+          \`lemonstudio project.flp\`.
+
+          ## Run without installing
+
+          \`\`\`bash
+          chmod +x lemonstudio
+          ./lemonstudio
+          \`\`\`
+          EOF
+
+          file "$PKG/lemonstudio"
+          ldd "$PKG/lemonstudio" | head -20
+          tar -C "$DIST" -czf "$DIST/${NAME}.tar.gz" lemonstudio
+
+          SHA256="$(sha256sum "$DIST/${NAME}.tar.gz" | cut -d' ' -f1)"
+          SIZE="$(stat -c%s "$DIST/${NAME}.tar.gz")"
+          cat > "$DIST/BUILD-INFO" <<EOF
+          version=${VERSION}
+          commit=${COMMIT}
+          built_at=${BUILT_AT}
+          tarball=${NAME}.tar.gz
+          sha256=${SHA256}
+          size=${SIZE}
+          run_id=${GITHUB_RUN_ID}
+          run_number=${GITHUB_RUN_NUMBER}
+          EOF
+          cat "$DIST/BUILD-INFO"
+          ls -lh "$DIST"
+
+      - name: Upload tarball and build info
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonstudio-linux-amd64
+          path: |
+            dist/*.tar.gz
+            dist/BUILD-INFO
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish from the self-hosted Mac
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: [self-hosted, macOS, ARM64, lemon]
+    timeout-minutes: 20
+    env:
+      # The launchd service's .path already has these, but keep the step
+      # explicit: jq lives in Homebrew, and the rest are macOS system tools.
+      PATH: /opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: lemonstudio-linux-amd64
+          path: ${{ runner.temp }}/lemonstudio-artifact
+
+      - name: Publish to the nginx endpoint
+        env:
+          LEMON_DIST_DIR: /Users/mac/Projects/Lemon-Studio/dist
+        run: |
+          .github/ci/linux-amd64/publish.sh "${{ runner.temp }}/lemonstudio-artifact"

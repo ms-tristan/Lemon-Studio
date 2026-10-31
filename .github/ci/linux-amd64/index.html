@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lemon Studio — Linux builds</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+         background: #14140f; color: #f3efd8;
+         font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  main { width: min(36rem, calc(100% - 3rem)); padding: 2rem 0; }
+  h1 { font-size: 1.6rem; margin: 0 0 .3rem; letter-spacing: -.02em; }
+  h1 span { color: #f2d64b; }
+  p.lead { color: #c9c3a4; margin-top: 0; }
+  a.card { display: block; margin: 1.4rem 0; padding: 1rem 1.15rem; border-radius: .7rem;
+           border: 1px solid #3a3a2a; background: #1d1d15; color: inherit; text-decoration: none; }
+  a.card:hover { border-color: #f2d64b; background: #24241a; }
+  a.card strong { display: block; color: #f2d64b; font-size: 1.02rem; }
+  a.card small { color: #a8a287; }
+  a.plain { color: #f2d64b; }
+  ul { padding-left: 1.1rem; color: #c9c3a4; }
+  li { margin: .25rem 0; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .9em;
+         background: #1d1d15; border: 1px solid #333326; border-radius: .3rem; padding: .05rem .3rem; }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: .35rem 1rem;
+       margin: 1.2rem 0 0; font-size: .9rem; }
+  dt { color: #8f8a73; }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  hr { border: 0; border-top: 1px solid #333326; margin: 1.6rem 0; }
+  footer { color: #8f8a73; font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span>Lemon</span> Studio</h1>
+  <p class="lead">Private downloads — Linux x86_64 builds.</p>
+
+  <a class="card" href="download/linux/amd64/lemonstudio-linux-amd64.tar.gz">
+    <strong>Download for Linux amd64 ↓</strong>
+    <small>lemonstudio-linux-amd64.tar.gz · @@SIZE@@</small>
+  </a>
+
+  <p>
+    <a class="plain" href="download/linux/amd64/">Versioned files and checksums →</a><br>
+    <a class="plain" href="latest.json">Build metadata (latest.json) →</a>
+  </p>
+
+  <p>Requirements:</p>
+  <ul>
+    <li>Linux x86_64, X11 or Wayland (through XWayland)</li>
+    <li>glibc 2.39 or newer (Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch current)</li>
+    <li>ALSA runtime (<code>libasound.so.2</code>)</li>
+    <li><code>zenity</code> or <code>kdialog</code> for the “save changes?” prompt (optional)</li>
+  </ul>
+
+  <p>Install without root:</p>
+  <ul>
+    <li><code>install -Dm755 lemonstudio ~/.local/bin/lemonstudio</code></li>
+    <li><code>install -Dm644 lemonstudio.png ~/.local/share/icons/hicolor/256x256/apps/lemonstudio.png</code></li>
+    <li><code>install -Dm644 lemonstudio.desktop ~/.local/share/applications/lemonstudio.desktop</code></li>
+  </ul>
+
+  <dl>
+    <dt>Version</dt><dd>@@VERSION@@ (pre-alpha)</dd>
+    <dt>Source</dt><dd>Lemon-Studio <code>main</code> @ <code>@@COMMIT@@</code></dd>
+    <dt>Built</dt><dd>@@BUILT_AT@@ on Ubuntu 24.04 x86_64 (GitHub Actions); published by the self-hosted macOS runner</dd>
+    <dt>Build</dt><dd><a href="@@RUN_URL@@">#@@RUN_NUMBER@@</a></dd>
+    <dt>SHA-256</dt><dd><code>@@SHA256@@</code></dd>
+  </dl>
+
+  <hr>
+  <footer>
+    Lemon Studio is pre-alpha software. Keep backups of your <code>.flp</code> projects.<br>
+    Built from source at <code>github.com/ItsAlphaNeon/Lemon-Studio</code>.
+  </footer>
+</main>
+</body>
+</html>
