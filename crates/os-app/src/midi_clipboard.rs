@@ -342,11 +342,16 @@ mod tests {
             "{:?}",
             app.state.message
         );
+        // A note already in the channel stays: the paste blends into the pattern instead of replacing it.
+        let existing = crate::piano::add_note(&mut app.state, 0, 0, 72);
+        crate::piano::pattern_mut(&mut app.state).notes[existing].length = 48;
+        assert_eq!(count(&app), 1);
         // The file's bytes: its notes arrive in the piano roll's channel, selected, and one undo step takes them back.
         set_test_source(Source::Data(smf_bytes()));
         app.state.message = None;
         press(&mut app);
-        assert_eq!(count(&app), 2, "{:?}", crate::piano::notes(&app.state));
+        assert_eq!(count(&app), 3, "{:?}", crate::piano::notes(&app.state));
+        assert!(crate::piano::notes(&app.state).iter().any(|n| n.key == 72 && n.position == 0), "the existing note stays");
         assert!(
             app.state
                 .message
@@ -359,7 +364,7 @@ mod tests {
             crate::history::undo(&mut app.state).is_some(),
             "one undo step"
         );
-        assert_eq!(count(&app), 0);
+        assert_eq!(count(&app), 1, "the paste alone is undone, the existing note stays");
     }
 
     /// With no channel to import into, Ctrl+Shift+V says so and imports nothing (spec §9).

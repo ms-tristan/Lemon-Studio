@@ -7695,7 +7695,8 @@ impl App {
             self.invalidate();
             return;
         }
-        let o = crate::midi_file::options_for(&smf);
+        // A paste adds to the pattern: the form's Blend setting is forced on so the channel's existing notes stay.
+        let o = crate::midi_file::Options { blend: true, ..crate::midi_file::options_for(&smf) };
         self.import_into_piano(&name, &smf, &o);
     }
 
