@@ -1,0 +1,149 @@
+# Private Linux x86_64 build of Lemon Studio, published to the nginx download
+# route https://lemon.tristanmasse.space/download/linux/amd64/ (HTTP Basic auth).
+#
+# This workflow exists only on the `build/linux-amd64` branch of the fork: it
+# turns the exact source at that commit into a downloadable tarball on a native
+# x86_64 Ubuntu 24.04 runner. The upstream CI already builds this platform on
+# every push, so the dependency set below matches .github/workflows/ci.yml.
+name: Build Linux amd64
+
+on:
+  push:
+    branches: [build/linux-amd64]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-linux-amd64-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Linux x86_64 release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same packages as the upstream CI: ALSA, Wayland (Lemon Sampler's file
+      # dialogs link wayland-client) and libclang (the time stretcher's
+      # bindings are generated at build time).
+      - name: Install Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libwayland-dev libclang-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: |
+          cargo --version
+          rustc --version
+          cargo build --release -p os-app --locked
+
+      # Native x86_64 runtime check: `--render` without arguments is handled
+      # before any window or audio device is opened, so this proves the binary
+      # actually starts and links against the runner's glibc/ALSA.
+      - name: Smoke test the binary
+        run: |
+          set +e
+          OUT="$(timeout 30 ./target/release/lemonstudio --render 2>&1)"
+          CODE=$?
+          set -e
+          printf '%s\n' "$OUT"
+          echo "exit code: $CODE"
+          ldd ./target/release/lemonstudio
+          [ "$CODE" -eq 2 ]
+          printf '%s' "$OUT" | grep -q "usage: lemonstudio --render"
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -A3 '^\[workspace.package\]' Cargo.toml | sed -n 's/^version = "\(.*\)"/\1/p' | head -1)"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          NAME="lemonstudio-${VERSION}-linux-amd64"
+          DIST="dist"
+          PKG="$DIST/lemonstudio"
+
+          test -x target/release/lemonstudio
+          rm -rf "$PKG"
+          mkdir -p "$PKG"
+          cp target/release/lemonstudio "$PKG/lemonstudio"
+          strip --strip-unneeded "$PKG/lemonstudio"
+          install -m 644 crates/os-app/assets/lemonstudio.png "$PKG/lemonstudio.png"
+          install -m 644 crates/os-app/assets/lemonstudio.desktop "$PKG/lemonstudio.desktop"
+          install -m 644 LICENSE "$PKG/LICENSE"
+          install -m 644 THIRD-PARTY-NOTICES.txt "$PKG/THIRD-PARTY-NOTICES.txt"
+
+          cat > "$PKG/INSTALL.md" <<EOF
+          # Lemon Studio ${VERSION} — Linux x86_64
+
+          Private build of Lemon Studio (commit \`${COMMIT}\`, built ${BUILT_AT}
+          on Ubuntu 24.04 x86_64).
+
+          Lemon Studio is pre-alpha software: keep backups of your \`.flp\` projects
+          and do not overwrite originals with files it saves.
+
+          ## Contents
+
+          - \`lemonstudio\` — the application (stripped release binary)
+          - \`lemonstudio.png\` — 256x256 icon
+          - \`lemonstudio.desktop\` — application-menu entry
+          - \`LICENSE\`, \`THIRD-PARTY-NOTICES.txt\`
+
+          ## Requirements
+
+          - Linux x86_64 (X11, or Wayland through XWayland)
+          - glibc 2.39 or newer: Ubuntu 24.04+, Debian 13+, Fedora 40+, Arch current
+          - ALSA runtime (\`libasound.so.2\`, normally installed)
+          - \`zenity\` or KDE's \`kdialog\` for the "save changes?" prompt (optional)
+
+          Lemon Studio's own instruments and effects are compiled into the binary;
+          no plugin bundle is needed to use them.
+
+          ## Install (no root)
+
+          \`\`\`bash
+          install -Dm755 lemonstudio ~/.local/bin/lemonstudio
+          install -Dm644 lemonstudio.png ~/.local/share/icons/hicolor/256x256/apps/lemonstudio.png
+          install -Dm644 lemonstudio.desktop ~/.local/share/applications/lemonstudio.desktop
+          \`\`\`
+
+          Make sure \`~/.local/bin\` is on your \`PATH\`, then start Lemon Studio from
+          the application menu or with \`lemonstudio\`. Open a project with
+          \`lemonstudio project.flp\`.
+
+          ## Run without installing
+
+          \`\`\`bash
+          chmod +x lemonstudio
+          ./lemonstudio
+          \`\`\`
+          EOF
+          # The heredoc above is indented with the YAML block; strip that indent
+          # so INSTALL.md stays plain Markdown instead of a code block.
+          sed -i 's/^          //' "$PKG/INSTALL.md"
+
+          file "$PKG/lemonstudio"
+          ldd "$PKG/lemonstudio" | head -20
+          tar -C "$DIST" -czf "$DIST/${NAME}.tar.gz" lemonstudio
+          ( cd "$DIST" && sha256sum "${NAME}.tar.gz" > SHA256SUMS )
+          ls -lh "$DIST"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: lemonstudio-linux-amd64
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
