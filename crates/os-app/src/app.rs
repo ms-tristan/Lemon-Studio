@@ -881,7 +881,7 @@ pub enum Drag {
     NoteMute { on: bool },
     /// Paint tool: notes back to back on `key` from `start`, `len` apart (§9).
     NotePaint { key: i32, start: u32, len: u32 },
-    /// Select tool marquee from (x0, y0); `base` = selection kept (Ctrl adds).
+    /// Select tool / Ctrl marquee from (x0, y0); `base` = selection kept (Ctrl+Shift adds).
     Marquee { x0: f32, y0: f32, base: Vec<usize> },
     /// Slice tool line, Zoom tool box, Playback scrub.
     Slice,
@@ -5248,9 +5248,12 @@ impl App {
                 Drag::NoteMute { on } => self.mute_at(x, y, on),
                 Drag::NotePaint { key, start, len } => self.paint_notes(key, start, len),
                 Drag::Marquee { x0, y0, base } => {
+                    // A box 2 pixels wide and tall is a click that wiggled a pixel (a span counts both its edges): the
+                    // press already chose what it holds, and boxing in from it would put a Ctrl+Shift toggle straight
+                    // back. A real drag selects from there on.
                     let r = Rect::span(x0.min(x), x0.max(x), y0.min(y), y0.max(y));
                     self.state.piano.overlay = Some(Overlay::Marquee(r));
-                    if let Some(g) = self.piano_geom() {
+                    if (r.w > 2.0 || r.h > 2.0) && let Some(g) = self.piano_geom() {
                         let s = &mut self.state;
                         let mut sel = base.clone();
                         sel.extend(piano::notes_in(s, &g, r).into_iter().filter(|i| !base.contains(i)));
@@ -6321,8 +6324,16 @@ impl App {
             return;
         }
         if let Some(a @ (Action::PianoNote(_) | Action::PianoGrid)) = action {
-            // Select: same as the left button; Zoom: toggle zoomed out / last zoom; the other
-            // tools delete while the right button is held (spec: ui/piano-roll.md §9).
+            // Ctrl+right-click zooms on the selection (§3a, no-op with nothing selected); right-click on empty grid
+            // space deselects every note (§9). Select: same as the left button; Zoom: toggle zoomed out / last zoom;
+            // the other tools delete while the right button is held.
+            if self.ctrl {
+                self.zoom_on_selection();
+                return;
+            }
+            if matches!(a, Action::PianoGrid) {
+                self.state.piano.clear_selection();
+            }
             match self.state.piano.tool {
                 Tool::Select => self.piano_click(&a),
                 Tool::Zoom => self.zoom_toggle(),
@@ -6689,6 +6700,50 @@ impl App {
             p.scroll_y = sy;
         }
         piano::clamp_scroll(&mut self.state, g.grid.h);
+        self.invalidate();
+    }
+
+    /// Ctrl+right-click in the piano roll (§3a): zoom on the selected notes, centred on them both ways; with no note
+    /// selected, on the time selection, keeping the keys where they are. Neither: nothing. The view before it is kept
+    /// for the Zoom tool's right-click, as [`zoom_to`](Self::zoom_to) does.
+    fn zoom_on_selection(&mut self) {
+        let Some(g) = self.piano_geom() else { return };
+        let ppq = f32::from(self.state.project.ppq.max(4));
+        let (span, keys) = {
+            let s = &self.state;
+            let sel = s.piano.selection(s.pattern, piano::channel(s));
+            let notes = piano::notes(s);
+            let picked: Vec<&Note> = sel.iter().filter_map(|&i| notes.get(i)).collect();
+            let span = if picked.is_empty() {
+                s.piano.range
+            } else {
+                let a = picked.iter().map(|n| n.position).min().unwrap_or(0);
+                let b = picked.iter().map(|n| n.position + piano::shown_len(s, n)).max().unwrap_or(0);
+                Some((a, b))
+            };
+            // The notes' key range: lo and hi.
+            let keys: Option<(i32, i32)> = picked.iter().map(|n| i32::from(n.key)).fold(None, |acc, k| {
+                Some(match acc {
+                    Some((lo, hi)) => (lo.min(k), hi.max(k)),
+                    None => (k, k),
+                })
+            });
+            (span, keys)
+        };
+        let Some((a, b)) = span.filter(|r| r.1 > r.0) else { return };
+        let s = &mut self.state;
+        let back = (s.piano.px_per_beat, s.piano.scroll_x, s.piano.scroll_y);
+        s.piano.px_per_beat = (g.grid.w / ((b - a) as f32 / ppq)).clamp(6.0, 1600.0);
+        s.piano.scroll_x = a as f32;
+        if let Some((lo, hi)) = keys {
+            // Vertically centred on the selected notes, as `piano::center_keys` centres the channel's notes.
+            let row = s.piano.row_h;
+            let centre = (lo + hi) as f32 / 2.0;
+            let max = (views::piano::TOP_KEY + 1) as f32 * row - g.grid.h;
+            s.piano.scroll_y = ((views::piano::TOP_KEY as f32 - centre) * row - g.grid.h / 2.0 + row / 2.0).clamp(0.0, max.max(0.0)).round();
+        }
+        s.piano.zoom_back = Some(back);
+        piano::clamp_scroll(s, g.grid.h);
         self.invalidate();
     }
 
@@ -7338,6 +7393,8 @@ impl App {
                 let notes = piano::notes(s);
                 s.piano.clipboard = sel.iter().filter_map(|&i| notes.get(i).copied()).collect();
             }
+            // Ctrl+Shift+V: File ▸ Paste from MIDI clipboard... (§9, spec: ui/midi-files.md).
+            Key::Character(c) if ctrl && self.shift && c.eq_ignore_ascii_case("v") && self.state.shown(Win::PianoRoll) => self.paste_midi_clipboard(),
             Key::Character(c) if ctrl && c.eq_ignore_ascii_case("v") && self.state.shown(Win::PianoRoll) => {
                 let clip = self.state.piano.clipboard.clone();
                 let at = piano::paste_tick(&self.state, &clip);
@@ -7348,6 +7405,18 @@ impl App {
                 if self.state.shown(Win::PianoRoll) =>
             {
                 self.piano_arrow(*k, ctrl, alt);
+            }
+            // Ctrl+Delete / Ctrl+Insert: cut the time selection's span out of the pattern, or open a gap that long at
+            // its start (§10, as the arranger's Delete space / Insert space).
+            Key::Named(NamedKey::Delete) if ctrl && self.state.shown(Win::PianoRoll) => {
+                if piano::delete_space(&mut self.state) {
+                    self.state.message = Some("Deleted the time selection from the pattern".into());
+                }
+            }
+            Key::Named(NamedKey::Insert) if ctrl && self.state.shown(Win::PianoRoll) => {
+                if piano::insert_space(&mut self.state) {
+                    self.state.message = Some("Opened a gap the time selection's length".into());
+                }
             }
             // Delete: the selection, or with nothing selected every note of the channel (spec: ui/piano-keys.md §4
             // rule 3).
@@ -7554,6 +7623,14 @@ impl App {
     fn piano_arrow(&mut self, k: winit::keyboard::NamedKey, ctrl: bool, alt: bool) {
         use winit::keyboard::NamedKey::*;
         let Some(g) = self.piano_geom() else { return };
+        // Ctrl+Left / Ctrl+Right: the time selection moves to the block before / after it, the same length as it
+        // (§10, FL's "Select time before/after selection equal to the selection length").
+        if ctrl && !self.shift && !alt && matches!(k, ArrowLeft | ArrowRight) {
+            if piano::select_time_step(&mut self.state, k == ArrowRight) {
+                self.invalidate();
+            }
+            return;
+        }
         let step = i64::from(crate::piano_snap::unit(&self.state).unwrap_or(1));
         let left = k == ArrowLeft;
         let (dt, dk) = match (k, ctrl, self.shift, alt) {
@@ -7565,7 +7642,7 @@ impl App {
                 return;
             }
             (ArrowLeft | ArrowRight, false, false, true) => (if left { -1 } else { 1 }, 0),
-            (_, _, _, true) | (ArrowUp | ArrowDown, true, true, _) | (ArrowLeft | ArrowRight, true, false, _) => return,
+            (_, _, _, true) | (ArrowUp | ArrowDown, true, true, _) => return,
             (ArrowUp, true, false, _) => (0, 12),
             (ArrowDown, true, false, _) => (0, -12),
             (ArrowLeft, false, true, _) => (-step, 0),
@@ -7599,6 +7676,30 @@ impl App {
             && !self.pl_focus()
     }
 
+    /// File ▸ Paste from MIDI clipboard... (§9 of spec: ui/midi-files.md): the Standard MIDI File the system
+    /// clipboard holds — or the `.mid` file it names — imported into the piano roll's channel through the MIDI file
+    /// import, without the form, undoably; a status message either way, and never a panic.
+    pub(crate) fn paste_midi_clipboard(&mut self) {
+        let Some((name, bytes)) = crate::midi_clipboard::read() else {
+            self.state.message = Some(crate::midi_clipboard::NOTHING.into());
+            self.invalidate();
+            return;
+        };
+        let Some(smf) = crate::midi_clipboard::smf(&bytes) else {
+            self.state.message = Some(crate::midi_clipboard::NOTHING.into());
+            self.invalidate();
+            return;
+        };
+        if piano::channel(&self.state).is_none() {
+            self.state.message = Some("Paste from MIDI clipboard: select a channel first".into());
+            self.invalidate();
+            return;
+        }
+        // A paste adds to the pattern: the form's Blend setting is forced on so the channel's existing notes stay.
+        let o = crate::midi_file::Options { blend: true, ..crate::midi_file::options_for(&smf) };
+        self.import_into_piano(&name, &smf, &o);
+    }
+
     /// Left click in the piano roll (spec: ui/piano-roll.md §8 Draw tool, §9 other tools).
     fn piano_click(&mut self, a: &Action) {
         let (x, y) = self.mouse;
@@ -7608,6 +7709,28 @@ impl App {
             return;
         };
         let tool = self.state.piano.tool;
+        // Ctrl turns any tool into Select (§9): a click takes the note alone (Ctrl+Shift adds or removes it), a drag
+        // from a note or from empty grid draws a box that replaces the selection (Ctrl+Shift: adds to it), and
+        // Ctrl+click on empty grid space deselects every note.
+        if self.ctrl && matches!(a, Action::PianoGrid | Action::PianoNote(_)) {
+            let s = &mut self.state;
+            let add = self.shift;
+            if let Action::PianoNote(i) = *a {
+                let mut sel = if add { s.piano.selection(s.pattern, Some(ch)) } else { Vec::new() };
+                if add && sel.contains(&i) {
+                    sel.retain(|&j| j != i);
+                } else if !sel.contains(&i) {
+                    sel.push(i);
+                }
+                s.piano.select(s.pattern, ch, sel);
+            } else if !add {
+                s.piano.clear_selection();
+            }
+            let base = if add { s.piano.selection(s.pattern, Some(ch)) } else { Vec::new() };
+            self.drag = Some(Drag::Marquee { x0: x, y0: y, base });
+            self.damage_piano();
+            return;
+        }
         if matches!(a, Action::PianoGrid | Action::PianoNote(_)) && tool != Tool::Draw {
             let s = &mut self.state;
             let note = if let Action::PianoNote(i) = *a { Some(i) } else { None };
@@ -7660,22 +7783,19 @@ impl App {
                     return;
                 }
                 Tool::Select if note.is_none() => {
-                    let base = if self.ctrl { s.piano.selection(s.pattern, Some(ch)) } else { Vec::new() };
-                    s.piano.select(s.pattern, ch, base.clone());
-                    self.drag = Some(Drag::Marquee { x0: x, y0: y, base });
+                    // A plain drag replaces the selection; Ctrl and Ctrl+Shift (which adds) were taken above.
+                    s.piano.select(s.pattern, ch, Vec::new());
+                    self.drag = Some(Drag::Marquee { x0: x, y0: y, base: Vec::new() });
                     self.damage_piano();
                     return;
                 }
                 Tool::Select => {
-                    // Clicking an unselected note selects it (Ctrl adds), then drags as Draw does.
+                    // Clicking an unselected note selects it; Ctrl+Shift toggles it in or out of the selection (taken
+                    // above), then the drag moves the notes as Draw does (§9).
                     let i = note.unwrap_or(0);
-                    let mut sel = s.piano.selection(s.pattern, Some(ch));
+                    let sel = s.piano.selection(s.pattern, Some(ch));
                     if !sel.contains(&i) {
-                        if !self.ctrl {
-                            sel.clear();
-                        }
-                        sel.push(i);
-                        s.piano.select(s.pattern, ch, sel);
+                        s.piano.select(s.pattern, ch, vec![i]);
                     }
                 }
                 // Paint on a note: drags that one note like Draw (no group move).
@@ -7752,8 +7872,13 @@ impl App {
             Action::PlaylistArea => {
                 if let Some(g) = grid {
                     if right && self.ctrl {
-                        // Ctrl+right-drag zooms to a box (§3).
-                        self.drag = Some(Drag::Pl(pl::PlDrag::ZoomBox { x0: self.mouse.0, y0: self.mouse.1 }));
+                        if self.shift {
+                            // Ctrl+Shift+right-click: zoom on the clip under the mouse (§3).
+                            pl::zoom_on_clip(self, g);
+                        } else {
+                            // Ctrl+right-drag zooms to a box; a click without a drag goes back to the last zoom (§3).
+                            self.drag = Some(Drag::Pl(pl::PlDrag::ZoomBack { x0: self.mouse.0, y0: self.mouse.1 }));
+                        }
                     } else {
                         pl::press_grid(self, g, right);
                     }
@@ -17865,7 +17990,6 @@ mod tests {
             (KeyCode::KeyE, "E", PlTool::Select),
             (KeyCode::KeyB, "B", PlTool::Paint),
             (KeyCode::KeyS, "S", PlTool::Slip),
-            (KeyCode::KeyC, "C", PlTool::Slice),
             (KeyCode::KeyD, "D", PlTool::Delete),
             (KeyCode::KeyY, "Y", PlTool::Playback),
             (KeyCode::KeyP, "P", PlTool::Draw),
@@ -17873,10 +17997,22 @@ mod tests {
             press(&mut app, code, l, true);
             assert_eq!(app.state.playlist.tool, t, "typing keyboard on: Shift+{l}");
         }
+        // Shift+C is not the Slice tool any more: it selects every clip of the current source (§3).
+        let (a, b) = (crate::playlist::place(&mut app.state, 0, 0), crate::playlist::place(&mut app.state, 1, 0));
+        assert!(a != b);
+        press(&mut app, KeyCode::KeyC, "C", true);
+        assert_eq!(app.state.playlist.tool, PlTool::Draw, "Shift+C selects by source");
+        assert_eq!(app.state.playlist.sel.len(), 2, "both clips of the current source");
         assert_eq!(app.state.piano.tool, piano, "the piano roll's tool stays");
         press(&mut app, KeyCode::KeyZ, "Z", true);
         press(&mut app, KeyCode::KeyT, "T", true);
         assert_eq!(app.state.playlist.tool, PlTool::Draw, "Shift+Z zooms, Shift+T places a loop");
+        // The plain letter is still the Slice tool.
+        if app.typing_on() {
+            app.toggle_typing();
+        }
+        press(&mut app, KeyCode::KeyC, "c", false);
+        assert_eq!(app.state.playlist.tool, PlTool::Slice, "plain C is still the Slice tool");
     }
 
     /// Enable groups (spec: ui/enable-groups.md): the toolbar button, OPTIONS > Enable groups and Shift+Alt+G toggle it

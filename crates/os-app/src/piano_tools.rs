@@ -55,6 +55,7 @@ pub fn tools_menu(s: &State, x: f32, y: f32) -> Popup {
     let items = vec![
         PItem::head("File"),
         PItem::new("Import MIDI file...", Cmd::MidiImport(true)),
+        PItem::new("Paste from MIDI clipboard...", Cmd::PasteMidiClipboard).key("Ctrl+Shift+V"),
         PItem::new("Export as MIDI file...", Cmd::MidiExport(true)),
         PItem::head("Edit"),
         item("Duplicate", Duplicate).key("Ctrl+B"),
@@ -84,14 +85,14 @@ pub fn tools_menu(s: &State, x: f32, y: f32) -> Popup {
 }
 
 /// The keys a held key repeats in the piano roll (spec: ui/piano-keys.md §4 rule 1): Shift / Ctrl / Alt + arrows (not
-/// Ctrl+Shift+Up / Down), PgUp / PgDn, Ctrl+B and Ctrl+V.
+/// Ctrl+Shift+Up / Down), PgUp / PgDn, Ctrl+B and Ctrl+V — not Ctrl+Shift+V, whose import must not run once per repeat.
 pub fn repeats(key: &winit::keyboard::Key, ctrl: bool, alt: bool, shift: bool) -> bool {
     use winit::keyboard::{Key, NamedKey};
     match key {
         Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown) => (shift || ctrl || alt) && !(ctrl && shift),
         Key::Named(NamedKey::ArrowLeft | NamedKey::ArrowRight) => shift || ctrl || alt,
         Key::Named(NamedKey::PageUp | NamedKey::PageDown) => true,
-        Key::Character(c) => ctrl && !alt && (c.eq_ignore_ascii_case("b") || c.eq_ignore_ascii_case("v")),
+        Key::Character(c) => ctrl && !alt && (c.eq_ignore_ascii_case("b") || (c.eq_ignore_ascii_case("v") && !shift)),
         _ => false,
     }
 }
